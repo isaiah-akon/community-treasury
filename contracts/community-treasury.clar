@@ -308,3 +308,67 @@
     )
   )
 )
+
+(define-public (execute-proposal (proposal-id uint))
+  ;; Executes an approved proposal by transferring funds to the target recipient
+  (begin
+    (try! (check-initialized))
+    (try! (validate-proposal-id proposal-id))
+
+    (let (
+        (proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
+        (contract-balance (stx-get-balance (as-contract tx-sender)))
+      )
+      (asserts! (not (get executed proposal)) err-unauthorized)
+      (asserts! (>= block-height (get expires-at proposal)) err-proposal-expired)
+      (asserts! (> (get yes-votes proposal) (get no-votes proposal))
+        err-unauthorized
+      )
+      (asserts! (>= contract-balance (get amount proposal))
+        err-insufficient-balance
+      )
+
+      ;; Execute approved proposal - transfer treasury funds
+      (try! (as-contract (stx-transfer? (get amount proposal) (as-contract tx-sender)
+        (get target proposal)
+      )))
+
+      ;; Mark proposal as successfully executed
+      (map-set proposals proposal-id (merge proposal { executed: true }))
+      (ok true)
+    )
+  )
+)
+
+;; READ-ONLY FUNCTIONS - DATA QUERIES
+
+(define-read-only (get-balance (account principal))
+  ;; Returns the governance token balance for a given account
+  (ok (default-to u0 (map-get? balances account)))
+)
+
+(define-read-only (get-total-supply)
+  ;; Returns the total supply of governance tokens in circulation
+  (ok (var-get total-supply))
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+  ;; Retrieves complete proposal data by ID
+  (ok (map-get? proposals proposal-id))
+)
+
+(define-read-only (get-deposit-info (account principal))
+  ;; Returns deposit information including lock status for an account
+  (ok (map-get? deposits account))
+)
+
+(define-read-only (get-vote
+    (proposal-id uint)
+    (voter principal)
+  )
+  ;; Checks if and how a specific voter voted on a proposal
+  (ok (map-get? votes {
+    proposal-id: proposal-id,
+    voter: voter,
+  }))
+)
