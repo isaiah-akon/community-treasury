@@ -1,0 +1,374 @@
+;; Title: CommunityTreasury - Decentralized Asset Management Protocol
+
+;; Summary:
+;; A sophisticated decentralized treasury management system that empowers communities
+;; to collectively manage digital assets through democratic governance mechanisms,
+;; featuring time-locked deposits, weighted voting, and transparent proposal execution.
+
+;; Description:
+;; CommunityTreasury revolutionizes how decentralized organizations manage their funds
+;; by implementing a robust governance framework built on the Stacks blockchain.
+;; The protocol enables community members to stake assets, propose funding initiatives,
+;; participate in weighted voting based on their contribution, and execute approved
+;; proposals automatically. With built-in security measures including time locks,
+;; minimum thresholds, and anti-manipulation safeguards, it provides a trustless
+;; environment for collaborative financial decision-making at scale.
+
+;; CONSTANTS & ERROR DEFINITIONS
+
+(define-constant contract-owner tx-sender)
+
+;; Error Constants
+(define-constant err-owner-only (err u100))
+(define-constant err-not-initialized (err u101))
+(define-constant err-already-initialized (err u102))
+(define-constant err-insufficient-balance (err u103))
+(define-constant err-invalid-amount (err u104))
+(define-constant err-unauthorized (err u105))
+(define-constant err-proposal-not-found (err u106))
+(define-constant err-proposal-expired (err u107))
+(define-constant err-already-voted (err u108))
+(define-constant err-below-minimum (err u109))
+(define-constant err-locked-period (err u110))
+(define-constant err-transfer-failed (err u111))
+(define-constant err-invalid-duration (err u112))
+(define-constant err-zero-amount (err u113))
+(define-constant err-invalid-target (err u114))
+(define-constant err-invalid-description (err u115))
+(define-constant err-invalid-proposal-id (err u116))
+(define-constant err-invalid-vote (err u117))
+
+;; Protocol Parameters
+(define-constant minimum-duration u144) ;; Minimum proposal duration: 1 day (assuming 10min blocks)
+(define-constant maximum-duration u20160) ;; Maximum proposal duration: 14 days
+
+;; DATA VARIABLES
+
+(define-data-var total-supply uint u0)
+(define-data-var minimum-deposit uint u1000000) ;; Minimum deposit in microSTX
+(define-data-var lock-period uint u1440) ;; Lock period: ~10 days in blocks
+(define-data-var initialized bool false)
+(define-data-var last-rebalance uint u0)
+(define-data-var proposal-count uint u0)
+
+;; DATA MAPS
+
+;; User token balances (governance weight)
+(define-map balances
+  principal
+  uint
+)
+
+;; Deposit tracking with time locks and reward calculations
+(define-map deposits
+  principal
+  {
+    amount: uint,
+    lock-until: uint,
+    last-reward-block: uint,
+  }
+)
+
+;; Proposal registry with complete metadata
+(define-map proposals
+  uint
+  {
+    proposer: principal,
+    description: (string-ascii 256),
+    amount: uint,
+    target: principal,
+    expires-at: uint,
+    executed: bool,
+    yes-votes: uint,
+    no-votes: uint,
+  }
+)
+
+;; Vote tracking to prevent double voting
+(define-map votes
+  {
+    proposal-id: uint,
+    voter: principal,
+  }
+  bool
+)
+
+;; PRIVATE HELPER FUNCTIONS
+
+(define-private (is-contract-owner)
+  ;; Validates if the transaction sender is the contract owner
+  (is-eq tx-sender contract-owner)
+)
+
+(define-private (check-initialized)
+  ;; Ensures the contract has been properly initialized
+  (ok (asserts! (var-get initialized) err-not-initialized))
+)
+
+(define-private (validate-proposal-id (proposal-id uint))
+  ;; Validates that the proposal ID exists within valid range
+  (ok (asserts! (<= proposal-id (var-get proposal-count)) err-invalid-proposal-id))
+)
+
+(define-private (calculate-voting-power (voter principal))
+  ;; Calculates voting power based on user's token balance
+  (default-to u0 (map-get? balances voter))
+)
+
+(define-private (transfer-tokens
+    (sender principal)
+    (recipient principal)
+    (amount uint)
+  )
+  ;; Internal token transfer with balance validation
+  (let (
+      (sender-balance (default-to u0 (map-get? balances sender)))
+      (recipient-balance (default-to u0 (map-get? balances recipient)))
+    )
+    (asserts! (>= sender-balance amount) err-insufficient-balance)
+    (map-set balances sender (- sender-balance amount))
+    (map-set balances recipient (+ recipient-balance amount))
+    (ok true)
+  )
+)
+
+(define-private (mint-tokens
+    (account principal)
+    (amount uint)
+  )
+  ;; Mints new governance tokens and updates total supply
+  (let ((current-balance (default-to u0 (map-get? balances account))))
+    (map-set balances account (+ current-balance amount))
+    (var-set total-supply (+ (var-get total-supply) amount))
+    (ok true)
+  )
+)
+
+(define-private (burn-tokens
+    (account principal)
+    (amount uint)
+  )
+  ;; Burns governance tokens with balance validation
+  (let ((current-balance (default-to u0 (map-get? balances account))))
+    (asserts! (>= current-balance amount) err-insufficient-balance)
+    (map-set balances account (- current-balance amount))
+    (var-set total-supply (- (var-get total-supply) amount))
+    (ok true)
+  )
+)
+
+;; PUBLIC FUNCTIONS - PROTOCOL MANAGEMENT
+
+(define-public (initialize)
+  ;; Initializes the treasury contract - can only be called once by owner
+  (begin
+    (asserts! (is-contract-owner) err-owner-only)
+    (asserts! (not (var-get initialized)) err-already-initialized)
+    (var-set initialized true)
+    (ok true)
+  )
+)
+
+;; PUBLIC FUNCTIONS - ASSET MANAGEMENT
+
+(define-public (deposit (amount uint))
+  ;; Deposits STX tokens and mints corresponding governance tokens with time lock
+  (begin
+    (try! (check-initialized))
+    (asserts! (>= amount (var-get minimum-deposit)) err-below-minimum)
+    (asserts! (> amount u0) err-zero-amount)
+
+    ;; Transfer STX to contract treasury
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+
+    ;; Update deposit records with time lock
+    (map-set deposits tx-sender {
+      amount: amount,
+      lock-until: (+ block-height (var-get lock-period)),
+      last-reward-block: block-height,
+    })
+
+    ;; Mint governance tokens equivalent to deposit
+    (mint-tokens tx-sender amount)
+  )
+)
+
+(define-public (withdraw (amount uint))
+  ;; Withdraws STX tokens after lock period expires, burns governance tokens
+  (begin
+    (try! (check-initialized))
+    (asserts! (> amount u0) err-zero-amount)
+
+    (let (
+        (deposit-info (unwrap! (map-get? deposits tx-sender) err-unauthorized))
+        (user-balance (unwrap! (get-balance tx-sender) err-unauthorized))
+      )
+      (asserts! (>= block-height (get lock-until deposit-info)) err-locked-period)
+      (asserts! (>= user-balance amount) err-insufficient-balance)
+
+      ;; Burn governance tokens first
+      (try! (burn-tokens tx-sender amount))
+
+      ;; Transfer STX back to user from treasury
+      (as-contract (stx-transfer? amount (as-contract tx-sender) tx-sender))
+    )
+  )
+)
+
+;; PUBLIC FUNCTIONS - GOVERNANCE SYSTEM
+
+(define-public (create-proposal
+    (description (string-ascii 256))
+    (amount uint)
+    (target principal)
+    (duration uint)
+  )
+  ;; Creates a new funding proposal with comprehensive validation
+  (begin
+    (try! (check-initialized))
+
+    ;; Comprehensive input validation
+    (asserts! (> (len description) u0) err-invalid-description)
+    (asserts! (> amount u0) err-zero-amount)
+    (asserts! (not (is-eq target (as-contract tx-sender))) err-invalid-target)
+    (asserts! (and (>= duration minimum-duration) (<= duration maximum-duration))
+      err-invalid-duration
+    )
+
+    (let (
+        (proposer-balance (unwrap! (map-get? balances tx-sender) err-unauthorized))
+        (proposal-id (+ (var-get proposal-count) u1))
+      )
+      (asserts! (> proposer-balance u0) err-unauthorized)
+
+      ;; Create new proposal with complete metadata
+      (map-set proposals proposal-id {
+        proposer: tx-sender,
+        description: description,
+        amount: amount,
+        target: target,
+        expires-at: (+ block-height duration),
+        executed: false,
+        yes-votes: u0,
+        no-votes: u0,
+      })
+
+      (var-set proposal-count proposal-id)
+      (ok proposal-id)
+    )
+  )
+)
+
+(define-public (vote
+    (proposal-id uint)
+    (vote-for bool)
+  )
+  ;; Casts a weighted vote on a proposal based on governance token balance
+  (begin
+    (try! (check-initialized))
+    (try! (validate-proposal-id proposal-id))
+
+    (let (
+        (proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
+        (voter-power (calculate-voting-power tx-sender))
+      )
+      (asserts! (> voter-power u0) err-unauthorized)
+      (asserts! (< block-height (get expires-at proposal)) err-proposal-expired)
+      (asserts!
+        (is-none (map-get? votes {
+          proposal-id: proposal-id,
+          voter: tx-sender,
+        }))
+        err-already-voted
+      )
+
+      ;; Record vote after comprehensive validation
+      (map-set votes {
+        proposal-id: proposal-id,
+        voter: tx-sender,
+      }
+        vote-for
+      )
+
+      ;; Update weighted vote tallies
+      (map-set proposals proposal-id
+        (merge proposal {
+          yes-votes: (if vote-for
+            (+ (get yes-votes proposal) voter-power)
+            (get yes-votes proposal)
+          ),
+          no-votes: (if vote-for
+            (get no-votes proposal)
+            (+ (get no-votes proposal) voter-power)
+          ),
+        })
+      )
+
+      (ok true)
+    )
+  )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+  ;; Executes an approved proposal by transferring funds to the target recipient
+  (begin
+    (try! (check-initialized))
+    (try! (validate-proposal-id proposal-id))
+
+    (let (
+        (proposal (unwrap! (map-get? proposals proposal-id) err-proposal-not-found))
+        (contract-balance (stx-get-balance (as-contract tx-sender)))
+      )
+      (asserts! (not (get executed proposal)) err-unauthorized)
+      (asserts! (>= block-height (get expires-at proposal)) err-proposal-expired)
+      (asserts! (> (get yes-votes proposal) (get no-votes proposal))
+        err-unauthorized
+      )
+      (asserts! (>= contract-balance (get amount proposal))
+        err-insufficient-balance
+      )
+
+      ;; Execute approved proposal - transfer treasury funds
+      (try! (as-contract (stx-transfer? (get amount proposal) (as-contract tx-sender)
+        (get target proposal)
+      )))
+
+      ;; Mark proposal as successfully executed
+      (map-set proposals proposal-id (merge proposal { executed: true }))
+      (ok true)
+    )
+  )
+)
+
+;; READ-ONLY FUNCTIONS - DATA QUERIES
+
+(define-read-only (get-balance (account principal))
+  ;; Returns the governance token balance for a given account
+  (ok (default-to u0 (map-get? balances account)))
+)
+
+(define-read-only (get-total-supply)
+  ;; Returns the total supply of governance tokens in circulation
+  (ok (var-get total-supply))
+)
+
+(define-read-only (get-proposal (proposal-id uint))
+  ;; Retrieves complete proposal data by ID
+  (ok (map-get? proposals proposal-id))
+)
+
+(define-read-only (get-deposit-info (account principal))
+  ;; Returns deposit information including lock status for an account
+  (ok (map-get? deposits account))
+)
+
+(define-read-only (get-vote
+    (proposal-id uint)
+    (voter principal)
+  )
+  ;; Checks if and how a specific voter voted on a proposal
+  (ok (map-get? votes {
+    proposal-id: proposal-id,
+    voter: voter,
+  }))
+)
